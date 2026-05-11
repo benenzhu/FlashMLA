@@ -21,6 +21,8 @@ CompileFlags:
     - "-Wno-invalid-constexpr"
     - -I/A/FlashMLA/csrc/cutlass/include/
     - -I/A/FlashMLA/csrc/
+    - -I/A/FlashMLA/csrc/kerutils/include/
+    - "-DKERUTILS_ENABLE_SM100A"
     - -I/usr/local/lib/python3.12/dist-packages/torch/include/torch/csrc/api/include/
     - -I/usr/local/lib/python3.12/dist-packages/torch/include/
     - -I/usr/include/python3.12/
