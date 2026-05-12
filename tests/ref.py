@@ -61,41 +61,65 @@ def ref_sparse_attn_decode(
     """
     assert p.h_kv == 1
     assert p.decode is not None
-    b = p.decode.b
+    b = p.decode.b # batch_size
 
     def process_kv_scope(kv_scope: KVScope) -> Tuple[torch.Tensor, torch.Tensor]:
-        assert kv_scope.indices_in_kvcache is not None
-        topk = kv_scope.indices_in_kvcache.size(-1)
+        assert kv_scope.indices_in_kvcache is not None # 这个请求的 indices
+        topk = kv_scope.indices_in_kvcache.size(-1) # [b, s_q, topk]
         indices_in_kv_cache_fixed = torch.clamp_min(kv_scope.indices_in_kvcache, 0) # Otherwise torch.index_select will complain
-        gathered_kv = kv_scope.blocked_k.view(-1, p.d_qk).index_select(0, indices_in_kv_cache_fixed.view(-1)).view(b, p.s_q, topk, p.d_qk)  # [b, s_q, topk, d]
-        invalid_mask = kv_scope.indices_in_kvcache == -1
+                     #[num_blocks * block_size * h_kv, d_qk]. select # 含义：沿 dim 维，按 indices 一个个取行（可重复、可乱序）, d_qk
+        gathered_kv = kv_scope.blocked_k.view(-1, p.d_qk).index_select(0, indices_in_kv_cache_fixed.view(-1)).view(b, p.s_q, topk, p.d_qk)  # [b, s_q, topk, d_qk]
+        invalid_mask = kv_scope.indices_in_kvcache == -1 # 原始的，里面有-1
         if kv_scope.topk_length is not None:
+            # [b, s_q, topk]  最后一维是 [0~topk), 为啥需要大于 topk_length? 为啥是 [0~topk)
+            # topk_length 是每个请求的length， 用 >= 来判断这个是否有效
+            # 结果类似： 
+            # batch 5 的结果（topk_length[5]=64）：                                  
+            # [F, F, F, ..., F (前 64 个), T, T, ..., T (后 64 个)]                  
+            #                             ↑ 这些位置无效  
             invalid_mask |= torch.arange(0, topk).view(1, 1, topk).broadcast_to(b, p.s_q, topk) >= kv_scope.topk_length.view(b, 1, 1)
         return gathered_kv, invalid_mask
     
+    # kv: [b, s_q, topk, d_qk]
+    # mask: [b, s_q, topk]
     gathered_kv, invalid_mask = process_kv_scope(t.kv_scope)
     if t.extra_kv_scope is not None:
+        # same, but from another attention, like swa & saprse attention in deepseek v4.
         gathered_kv1, invalid_mask1 = process_kv_scope(t.extra_kv_scope)
+        # concat, cause softmax will be calculated together.
         gathered_kv = torch.cat([gathered_kv, gathered_kv1], dim=2)  # [b, s_q, topk+extra_topk, d]
         invalid_mask = torch.cat([invalid_mask, invalid_mask1], dim=2)   # [b, s_q, topk+extra_topk]
 
+    # [b*s_q, topk+extra, d_qk]
     gathered_kv = gathered_kv.view(b*p.s_q, -1, p.d_qk).float()
+    # nan to 0
     gathered_kv[gathered_kv != gathered_kv] = 0.0
+    # [b, s_q, h_q, d_qk] -> [b*s_q, ...]
     q = t.q.float().view(b*p.s_q, p.h_q, p.d_qk)
+    # [b * s_q, h_q, topk+extra]   = [b * s_q, h_q, d_qk] @ [b * s_q, d_qk, topk+extra]
     attn_weight = q @ gathered_kv.transpose(-1, -2)  # [t.b*t.s_q, t.h_q, topk+extra_topk]
+    # what sm_scale means? remember before.
     attn_weight *= t.sm_scale
+    # mask: [b * s_q, 1, topk+extra_topk] 
+    # invalid 地方 mask 成 -inf. softmax 出来是 0.
     attn_weight[invalid_mask.view(b*p.s_q, 1, -1).broadcast_to(b*p.s_q, p.h_q, invalid_mask.size(-1))] = float("-inf")
+    # forget what logsumexp do with softmax?
     lse = attn_weight.logsumexp(dim=-1)  # [t.b*t.s_q, t.h_q]
+    # softmax result?
     attn_weight = torch.exp(attn_weight - lse.unsqueeze(-1))
+    # why only p_d_v?
+    # [b*s_q, h_q, d_qk] = [b *s_q, h_q, topk+ex_topk] @ [b*s_q, topk+extra, d_qk]
+    # KV一起，然后d_v只是 kv的一个前缀.  MLA里面的特点？在 ds_v1中是一样的.
     output = attn_weight @ gathered_kv[..., :p.d_v]    # [t.b*t.s_q, t.h_q, t.dv]
     output = output.view(b, p.s_q, p.h_q, p.d_v)
     lse = lse.view(b, p.s_q, p.h_q)
 
     # Attention sink
+    # what did this do? # what's the shape of attn_sink?
     if t.attn_sink is not None:
         output *= (1.0 / (1.0 + torch.exp(t.attn_sink.view(1, 1, p.h_q) - lse))).unsqueeze(-1)
 
-    # Correct for q tokens which has no attendable k
+    # ????? ###Correct for q tokens which has no attendable k
     lonely_q_mask = (lse == float("-inf"))
     output[lonely_q_mask.unsqueeze(-1).broadcast_to(b, p.s_q, p.h_q, p.d_v)] = 0.0
     lse[lonely_q_mask] = float("+inf")

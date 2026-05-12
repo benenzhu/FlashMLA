@@ -18,6 +18,14 @@ namespace sm100::fwd_for_small_topk::head128 {
 
 using namespace cute;
 using FwdMode = SparseAttnFwdMode;
+/*
+  Grid
+   └── Cluster                    ← 多个 CTA 组成（这里是 2 个）               !!!!!!!!
+        └── CTA (= block)         ← 1 个 thread block，跑在 1 个 SM 上
+             └── Warpgroup (WG)   ← 4 个 warp = 128 线程（Hopper 引入的概念）  !!!!!!!!
+                  └── Warp        ← 32 线程
+                       └── Lane   ← 1 个线程
+*/
 
 template<FwdMode FWD_MODE, int D_QK>
 __device__ void
@@ -25,6 +33,12 @@ KernelTemplate<FWD_MODE, D_QK>::sparse_attn_fwd_kernel_devfunc(const ArgT &param
 #ifdef KERUTILS_ENABLE_SM100A
     // Grid shape: [2*s_q, 1, 1] for prefilling, [2*s_q, num_sm_parts, 1] for decoding
     // Cluster shape: [2, 1, 1]
+    /*
+      - 当前线程属于本 CTA 内的第几个 warp，范围 [0, 16)。
+      - "canonical" 的意思是：warp 内 32 个线程都拿到同一个值（用 __shfl_sync 把 lane 0 的值广播给整个 warp）。如果直接用 threadIdx.x/32，编译器没法推断出 warp uniform，可能生成更差的代码。
+      - _sync 后缀就是显式调一次 warp shuffle 同步。                                                                                                                                         
+      - 用途：后面靠 warp_idx 给 16 个 warp 分工（warp 0/1/2/3 是 WG0，warp 8 在 WG2 里专门发 UMMA…）。 
+    */
     const int warp_idx = cutlass::canonical_warp_idx_sync();
     const int lane_idx = threadIdx.x % 32;
     const int warpgroup_idx = cutlass::canonical_warp_group_idx();
@@ -34,32 +48,47 @@ KernelTemplate<FWD_MODE, D_QK>::sparse_attn_fwd_kernel_devfunc(const ArgT &param
     extern __shared__ char wksp_buf[];
     SharedMemoryPlan &smem = *reinterpret_cast<SharedMemoryPlan*>(wksp_buf);
 
+    /* === 启动期初始化：4 个 warp 并行做不同的 setup 任务 ===
+       warp 0: 预取 TMA descriptor 到缓存（PTX: cp.async.bulk.prefetch.tensor），
+         让后续真正发 TMA copy 时硬件能直接拿到 128B 的 CUtensorMap，不用走 global memory。
+         elect_one_sync() = 硬件级 elect.sync，warp 内只选一个 active 线程执行（其余 31 个跳过），
+         所以全 CTA 实际只有 1 个线程发这些 prefetch。
+       if constexpr 是编译期分支：decode/prefill 走不同 KV 布局，编译期就裁掉另一支。
+    */
     if (warp_idx == 0 && elect_one_sync()) {
-        cute::prefetch_tma_descriptor(&tma_params.tensor_map_q);
-        cute::prefetch_tma_descriptor(&tma_params.tensor_map_o);
+        cute::prefetch_tma_descriptor(&tma_params.tensor_map_q);   // Q 的 descriptor
+        cute::prefetch_tma_descriptor(&tma_params.tensor_map_o);   // 输出 O 的 descriptor
         if constexpr (IS_DECODE) {
+            // decode：KV 拆成 NoPE(fp8) + RoPE(bf16) 两个独立 descriptor
             cute::prefetch_tma_descriptor(&tma_params.tensor_map_kv_nope);
             cute::prefetch_tma_descriptor(&tma_params.tensor_map_kv_rope);
         } else {
+            // prefill：KV 是单一 bf16 张量，一个 descriptor 搞定
             cute::prefetch_tma_descriptor(&tma_params.tensor_map_kv);
         }
+    /* warp 1: 初始化 mbarrier（住在 smem 的硬件信号灯，SM90+ 核心同步原语）。
+       init(N) 里的 N = 需要多少次 arrive 才算"满"、phase 才翻转 → 必须与后面 arrive() 的总次数严格对上，否则死锁。
+       命名规律：xxx_full（producer arrive / consumer wait）+ xxx_empty（consumer arrive / producer wait）= 乒乓 buffer。
+       256 = 128 线程 × 2 CTA：cluster 模式下 barrier 可跨 CTA 共享（配合 umma_arrive_multicast_2x1SM）。
+    */
     } else if (warp_idx == 1 && elect_one_sync()) {
-        smem.bar_sQ_full.init(1);
-        smem.bar_tQ_empty.init(1);
-        smem.bar_tQ_full.init(1);
-        smem.bar_tOut_full.init(1);
-        smem.bar_tOut_empty.init(256);
-        smem.bar_P_empty.init(256);
-        smem.bar_QK_done.init(1);
-        smem.bar_SV_done.init(1);
-        smem.bar_S_O_full.init(256);
-        smem.bar_li_full.init(H_Q/2);
-        smem.bar_li_empty.init(128);
+        smem.bar_sQ_full.init(1);       // smem Q 装好（TMA 完成时 1 次 arrive）
+        smem.bar_tQ_empty.init(1);      // TMEM Q 已被 MMA 读走
+        smem.bar_tQ_full.init(1);       // TMEM Q 装好（UTCCP 完成）
+        smem.bar_tOut_full.init(1);     // TMEM O 装好（最终 O MMA 完成）
+        smem.bar_tOut_empty.init(256);  // TMEM O 已被 WG0+WG3 读走（128*2 CTA）
+        smem.bar_P_empty.init(256);     // TMEM P 已被 WG3 softmax 读走
+        smem.bar_QK_done.init(1);       // P = Q·Kᵀ MMA 完成
+        smem.bar_SV_done.init(1);       // O += S·V MMA 完成
+        smem.bar_S_O_full.init(256);    // S 写好 & 可继续累加 O（WG3 256 线程 arrive）
+        smem.bar_li_full.init(H_Q/2);   // output_scale 算好（WG3 中 64 线程 arrive，每行一个）
+        smem.bar_li_empty.init(128);    // rowwise_li_buf 可被 WG3 重写（WG0 128 线程 arrive）
         if constexpr (FWD_MODE != FwdMode::DecodeWithSplitKV) {
-            smem.bar_clc_full.init(1);
-            smem.bar_clc_empty.init(NUM_WORKER_THREADS);
+            // CLC = Cluster Launch Control，prefill 用它做动态任务调度（decode 走静态 sched_meta，不需要）
+            smem.bar_clc_full.init(1);                     // CLC 硬件返回下一任务号
+            smem.bar_clc_empty.init(NUM_WORKER_THREADS);   // 所有 worker 都进入新 phase 后才能再发 CLC 查询
         }
-        fence_barrier_init();
+        fence_barrier_init();           // 保证 init 写入对所有 warp/CTA 可见，之后才能进入 cluster barrier
     } else if (warp_idx == 2) {
         cute::TMEM::Allocator2Sm().allocate(512, smem.tmem_start_addr.data());
         KU_TRAP_ONLY_DEVICE_ASSERT(smem.tmem_start_addr.data()[0] == 0);
